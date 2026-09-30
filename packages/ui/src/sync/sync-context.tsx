@@ -1585,6 +1585,10 @@ const notifyPermissionAsked = (permission: PermissionRequest, directory: string)
  * always, `safety` while the safety net can run. Those raise no toast when
  * asked; a request the safety net holds is announced when it is held
  * (`notifyHeldPermission`).
+ *
+ * This decides the toast only. The request is still stored, because the
+ * safety net rules on it later: a held request needs its card, its sidebar
+ * badge, and the entry `notifyHeldPermission` looks up.
  */
 const isAnsweredWithoutUser = (sessionID: string): boolean => {
   const mode = usePermissionStore.getState().getSessionMode(sessionID)
@@ -1852,12 +1856,16 @@ export function handleEvent(
       )
       return
     }
+    // Whether the server answers this request on its own is known only once
+    // the safety net rules on it, later. So the event is never dropped here:
+    // it falls through to the reducer that stores it, and only the toast is
+    // conditional. A request the net holds keeps its card and its sidebar
+    // badge, and `notifyHeldPermission` has the entry it looks up.
     if (!isVSCodeRuntime() && isAnsweredWithoutUser(permission.sessionID)) {
       updateRoutingIndexFromEvent(routingIndex, resolvedDirectory, payload)
-      return
+    } else {
+      notifyPermissionAsked(permission, resolvedDirectory)
     }
-
-    notifyPermissionAsked(permission, resolvedDirectory)
   }
 
   if (payload.type === "permission.replied") {
