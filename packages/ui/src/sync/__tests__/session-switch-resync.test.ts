@@ -30,10 +30,31 @@ mock.module("@/lib/opencode/client", () => ({
 
 const autoAcceptSnapshots: Array<{ snapshot: { modes: Record<string, string>; revision?: number }; runtimeKey?: string }> = []
 
+// The mode the mocked permission store reports for every session, and whether
+// a classification provider can run the safety net. `ask` plus an available
+// net keeps the existing tests' behaviour; the safety case flips them per test.
+let sessionMode = "ask"
+let safetyNetAvailable = true
+
+const routingState = () => ({
+  available: true,
+  jevAvailable: safetyNetAvailable,
+  held: {} as Record<string, unknown>,
+  releasePermission: () => undefined,
+})
+
+// Callable like the real hook and readable like its store, so both call styles
+// used across the module graph keep working.
+mock.module("@/stores/useRoutingStore", () => ({
+  useRoutingStore: Object.assign(() => routingState(), { getState: routingState }),
+  selectSafetyNetAvailable: (state: { available: boolean; jevAvailable: boolean }) =>
+    state.available && state.jevAvailable,
+}))
+
 mock.module("@/stores/permissionStore", () => ({
   usePermissionStore: {
     getState: () => ({
-      getSessionMode: () => "ask",
+      getSessionMode: () => sessionMode,
       applySnapshot: (snapshot: { modes: Record<string, string>; revision?: number }, runtimeKey?: string) => {
         autoAcceptSnapshots.push({ snapshot, runtimeKey })
       },
@@ -430,6 +451,57 @@ describe("OpenChamber-native frames", () => {
       expect(childStores.children.size).toBe(0)
     } finally {
       childStores.disposeAll()
+    }
+  })
+})
+
+// A permission the safety net holds still has to reach the user. Before the
+// fix, a safety session's `permission.asked` returned before the reducer ran,
+// so the request never entered the store and every held request vanished.
+describe("permission.asked in a session that may answer on its own", () => {
+  const sender = (childStores: ChildStoreManager, routingIndex: ReturnType<typeof createEventRoutingIndex>) =>
+    (event: SyncEvent) => handleEvent("/repo", event, childStores, routingIndex, getRuntimeKey())
+
+  const permissionAsked = (id = "perm_held"): SyncEvent => ({
+    type: "permission.asked",
+    properties: { ...buildPermission({ id }), sessionID: "ses_a" },
+  } as SyncEvent)
+
+  const deliver = (mode: string, net: boolean, run: (send: (event: SyncEvent) => void, store: () => DirectoryStore | undefined) => void) => {
+    sessionMode = mode
+    safetyNetAvailable = net
+    infoToasts.length = 0
+    const childStores = new ChildStoreManager()
+    childStores.ensureChild("/repo", { bootstrap: false })
+    const routingIndex = createEventRoutingIndex()
+    try {
+      run(sender(childStores, routingIndex), () => childStores.getChild("/repo"))
+    } finally {
+      childStores.disposeAll()
+    }
+  }
+
+  beforeEach(() => {
+    infoToasts.length = 0
+    sessionMode = "ask"
+    safetyNetAvailable = true
+  })
+
+  test("stores the request while it waits, in every mode", () => {
+    for (const [mode, net] of [["auto", true], ["safety", true], ["safety", false], ["ask", false]] as const) {
+      deliver(mode, net, (send, store) => {
+        send(permissionAsked())
+        expect(store()?.getState().permission.ses_a?.map((entry) => entry.id)).toEqual(["perm_held"])
+      })
+    }
+  })
+
+  test("silences the toast only while a mode can answer the request itself", () => {
+    for (const [mode, net, toasts] of [["auto", true, 0], ["safety", true, 0], ["safety", false, 1], ["ask", false, 1]] as const) {
+      deliver(mode, net, (send) => {
+        send(permissionAsked())
+        expect(infoToasts).toHaveLength(toasts)
+      })
     }
   })
 })
