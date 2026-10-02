@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, mock } from "bun:test"
+import { describe, expect, test, afterEach, beforeEach, mock } from "bun:test"
 import { create, type StoreApi } from "zustand"
 import type { SyncEvent, ToolTransition } from "@/lib/opencode/events"
 import type { FormRequest, PermissionRequest } from "@/lib/opencode/model"
@@ -31,24 +31,15 @@ mock.module("@/lib/opencode/client", () => ({
 const autoAcceptSnapshots: Array<{ snapshot: { modes: Record<string, string>; revision?: number }; runtimeKey?: string }> = []
 
 // The mode the mocked permission store reports for every session, and whether
-// a classification provider can run the safety net. `ask` plus an available
-// net keeps the existing tests' behaviour; the safety case flips them per test.
+// a classification provider can run the safety net.
 let sessionMode = "ask"
 let safetyNetAvailable = true
 
-const routingState = () => ({
-  available: true,
-  jevAvailable: safetyNetAvailable,
-  held: {} as Record<string, unknown>,
-  releasePermission: () => undefined,
-})
-
-// Callable like the real hook and readable like its store, so both call styles
-// used across the module graph keep working.
 mock.module("@/stores/useRoutingStore", () => ({
-  useRoutingStore: Object.assign(() => routingState(), { getState: routingState }),
-  selectSafetyNetAvailable: (state: { available: boolean; jevAvailable: boolean }) =>
-    state.available && state.jevAvailable,
+  useRoutingStore: {
+    getState: () => ({ available: true, jevAvailable: safetyNetAvailable, releasePermission: () => undefined }),
+  },
+  selectSafetyNetAvailable: (state: { available: boolean; jevAvailable: boolean }) => state.available && state.jevAvailable,
 }))
 
 mock.module("@/stores/permissionStore", () => ({
@@ -455,27 +446,29 @@ describe("OpenChamber-native frames", () => {
   })
 })
 
-// A permission the safety net holds still has to reach the user. Before the
-// fix, a safety session's `permission.asked` returned before the reducer ran,
-// so the request never entered the store and every held request vanished.
-describe("permission.asked in a session that may answer on its own", () => {
-  const sender = (childStores: ChildStoreManager, routingIndex: ReturnType<typeof createEventRoutingIndex>) =>
-    (event: SyncEvent) => handleEvent("/repo", event, childStores, routingIndex, getRuntimeKey())
+// In a session the server may answer on its own, a request stays out of sight
+// until the server says it left the request for the user, so an accepted one
+// never flashes a card and a held one is never lost.
+describe("permission.asked in a session the server may answer", () => {
+  const leftForUser = (permissionId: string, directory: string | null = "/repo"): SyncEvent => ({
+    type: "openchamber.permission-left-for-user",
+    properties: { permissionId, sessionId: "ses_a", directory },
+  })
+  const asked = (id: string): SyncEvent => ({ type: "permission.asked", properties: buildPermission({ id }) })
+  const replied = (requestID: string): SyncEvent => ({ type: "permission.replied", properties: { sessionID: "ses_a", requestID } })
 
-  const permissionAsked = (id = "perm_held"): SyncEvent => ({
-    type: "permission.asked",
-    properties: { ...buildPermission({ id }), sessionID: "ses_a" },
-  } as SyncEvent)
-
-  const deliver = (mode: string, net: boolean, run: (send: (event: SyncEvent) => void, store: () => DirectoryStore | undefined) => void) => {
-    sessionMode = mode
-    safetyNetAvailable = net
-    infoToasts.length = 0
+  const withDirectory = (
+    options: { store: boolean },
+    run: (send: (event: SyncEvent) => void, storedIds: () => string[] | undefined) => void,
+  ) => {
     const childStores = new ChildStoreManager()
-    childStores.ensureChild("/repo", { bootstrap: false })
+    if (options.store) childStores.ensureChild("/repo", { bootstrap: false })
     const routingIndex = createEventRoutingIndex()
     try {
-      run(sender(childStores, routingIndex), () => childStores.getChild("/repo"))
+      run(
+        (event) => handleEvent("/repo", event, childStores, routingIndex, getRuntimeKey()),
+        () => childStores.getChild("/repo")?.getState().permission.ses_a?.map((entry) => entry.id),
+      )
     } finally {
       childStores.disposeAll()
     }
@@ -483,25 +476,73 @@ describe("permission.asked in a session that may answer on its own", () => {
 
   beforeEach(() => {
     infoToasts.length = 0
-    sessionMode = "ask"
+    sessionMode = "safety"
     safetyNetAvailable = true
   })
 
-  test("stores the request while it waits, in every mode", () => {
-    for (const [mode, net] of [["auto", true], ["safety", true], ["safety", false], ["ask", false]] as const) {
-      deliver(mode, net, (send, store) => {
-        send(permissionAsked())
-        expect(store()?.getState().permission.ses_a?.map((entry) => entry.id)).toEqual(["perm_held"])
+  afterEach(() => {
+    sessionMode = "ask"
+  })
+
+  test("keeps the request out of sight only while the server can answer it", () => {
+    const cases = [
+      { mode: "auto", net: true, shown: false },
+      { mode: "safety", net: true, shown: false },
+      { mode: "safety", net: false, shown: true },
+      { mode: "ask", net: true, shown: true },
+    ]
+    for (const { mode, net, shown } of cases) {
+      sessionMode = mode
+      safetyNetAvailable = net
+      infoToasts.length = 0
+      const id = `perm_${mode}_${net}`
+      withDirectory({ store: true }, (send, storedIds) => {
+        send(asked(id))
+        expect(storedIds()).toEqual(shown ? [id] : undefined)
+        expect(infoToasts).toHaveLength(shown ? 1 : 0)
       })
     }
   })
 
-  test("silences the toast only while a mode can answer the request itself", () => {
-    for (const [mode, net, toasts] of [["auto", true, 0], ["safety", true, 0], ["safety", false, 1], ["ask", false, 1]] as const) {
-      deliver(mode, net, (send) => {
-        send(permissionAsked())
-        expect(infoToasts).toHaveLength(toasts)
-      })
-    }
+  test("shows a request the server left for the user, once", () => {
+    withDirectory({ store: true }, (send, storedIds) => {
+      send(asked("perm_held"))
+      send(leftForUser("perm_held"))
+      expect(storedIds()).toEqual(["perm_held"])
+      expect(infoToasts).toHaveLength(1)
+
+      // Reconnect reconciliation reports a still-held request again.
+      send(leftForUser("perm_held"))
+      expect(storedIds()).toEqual(["perm_held"])
+      expect(infoToasts).toHaveLength(1)
+    })
+  })
+
+  test("forgets a request answered before the server reported on it", () => {
+    withDirectory({ store: true }, (send, storedIds) => {
+      send(asked("perm_accepted"))
+      send(replied("perm_accepted"))
+      send(leftForUser("perm_accepted"))
+      expect(storedIds()).toBeUndefined()
+      expect(infoToasts).toHaveLength(0)
+    })
+  })
+
+  test("shows at once a request whose report arrived first", () => {
+    withDirectory({ store: true }, (send, storedIds) => {
+      send(leftForUser("perm_early"))
+      send(asked("perm_early"))
+      expect(storedIds()).toEqual(["perm_early"])
+      expect(infoToasts).toHaveLength(1)
+    })
+  })
+
+  test("announces a held request in a directory without a store", () => {
+    withDirectory({ store: false }, (send) => {
+      send(asked("perm_unopened"))
+      expect(infoToasts).toHaveLength(0)
+      send(leftForUser("perm_unopened"))
+      expect(infoToasts).toHaveLength(1)
+    })
   })
 })
